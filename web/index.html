@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FileForge · 文件工坊</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234a6fa5'/%3E%3Cpath d='M11 8h11v3.5h-7v4h6v3.5h-6V24h-4z' fill='%23f3f5f7'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f3f5f7;
+    --panel: #ffffff;
+    --border: #d9dee5;
+    --primary: #4a6fa5;
+    --primary-dark: #3b5a87;
+    --primary-soft: #e8edf4;
+    --text: #2c3540;
+    --text-sub: #66707c;
+    --status-pending: #8a94a0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
+  header { margin-bottom: 24px; }
+  header h1 { font-size: 22px; font-weight: 600; }
+  header h1 span { font-size: 14px; font-weight: 400; color: var(--text-sub); margin-left: 8px; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-top: 16px;
+  }
+  .panel h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+
+  .dropzone {
+    margin-top: 16px;
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    padding: 40px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s, background-color .15s;
+  }
+  .dropzone.over { border-color: var(--primary); background: var(--primary-soft); }
+  .pick-btn {
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 32px;
+    font-size: 15px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background-color .15s;
+  }
+  .pick-btn:hover { background: var(--primary-dark); }
+  .dz-main { font-size: 16px; color: var(--text); margin-top: 14px; }
+  .dz-sub { font-size: 13px; color: var(--text-sub); margin-top: 4px; }
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .row { display: flex; align-items: center; gap: 14px; }
+  .row label { font-size: 14px; color: var(--text-sub); white-space: nowrap; }
+  .row input[type="range"] { flex: 1; accent-color: var(--primary); }
+  .row .hint { font-size: 12px; color: var(--text-sub); white-space: nowrap; }
+  .row output {
+    min-width: 34px; text-align: center;
+    font-variant-numeric: tabular-nums;
+    background: var(--primary-soft); color: var(--primary-dark);
+    border-radius: 6px; padding: 2px 8px; font-weight: 600;
+  }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 14px; }
+  th { color: var(--text-sub); font-weight: 500; font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .status { color: var(--status-pending); font-size: 13px; }
+  .empty { color: var(--text-sub); font-size: 13px; padding: 8px 10px; }
+
+  .prog-row { display: flex; align-items: center; gap: 14px; }
+  .bar { flex: 1; height: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .bar-fill { height: 100%; width: 0; background: var(--primary); transition: width .3s; }
+  #progText { font-variant-numeric: tabular-nums; color: var(--text-sub); font-size: 14px; white-space: nowrap; }
+  .prog-actions { display: flex; align-items: center; gap: 14px; margin-top: 14px; }
+  .dl-btn {
+    display: inline-block;
+    background: var(--primary);
+    color: #fff;
+    border-radius: 8px;
+    padding: 9px 26px;
+    font-size: 14px;
+    text-decoration: none;
+    transition: background-color .15s;
+  }
+  .dl-btn:hover { background: var(--primary-dark); }
+  #statText { font-size: 13px; color: var(--text-sub); }
+
+  .hist-empty { color: var(--text-sub); font-size: 13px; padding: 6px 10px; }
+  td.ok { color: var(--primary-dark); font-weight: 600; font-variant-numeric: tabular-nums; }
+  td.run { color: var(--text-sub); }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <header>
+    <h1>FileForge<span>文件工坊 · 本地批量图片处理</span></h1>
+  </header>
+
+  <section class="dropzone" id="dropzone">
+    <input type="file" id="fileInput" multiple class="sr-only" aria-hidden="true" tabindex="-1">
+    <button type="button" class="pick-btn" id="pickBtn">选择文件</button>
+    <p class="dz-main">将图片拖到此处，或点击选择</p>
+    <p class="dz-sub">jpg / png，支持批量，文件不会离开你的电脑</p>
+  </section>
+
+  <section class="panel row">
+    <label for="concurrency">并发数</label>
+    <input type="range" id="concurrency" min="1" max="32" value="8">
+    <output id="concVal">8</output>
+  </section>
+
+  <section class="panel row">
+    <label for="quality">压缩质量</label>
+    <input type="range" id="quality" min="50" max="95" step="5" value="80">
+    <output id="qualityVal">80</output>
+    <span class="hint">低 → 体积更小 · 高 → 画质更高</span>
+  </section>
+
+  <section class="panel" id="progressPanel" hidden>
+    <div class="prog-row">
+      <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+      <span id="progText">0/0</span>
+    </div>
+    <div class="prog-actions">
+      <a id="downloadBtn" class="dl-btn" hidden>下载结果 zip</a>
+      <span id="statText"></span>
+    </div>
+  </section>
+
+  <section class="panel" id="filePanel" hidden>
+    <h2>文件列表</h2>
+    <table>
+      <thead>
+        <tr><th>文件名</th><th>大小</th><th>状态</th></tr>
+      </thead>
+      <tbody id="fileList"></tbody>
+    </table>
+  </section>
+
+  <section class="panel" id="historyPanel">
+    <h2>历史耗时对比</h2>
+    <table>
+      <thead>
+        <tr><th>时间</th><th>文件数</th><th>并发</th><th>质量</th><th>状态</th><th>总耗时</th></tr>
+      </thead>
+      <tbody id="historyList"></tbody>
+    </table>
+    <p class="hist-empty" id="historyEmpty">还没有任务记录，拖入图片开始第一批处理。</p>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
