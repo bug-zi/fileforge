@@ -48,7 +48,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	return ts
 }
 
-func upload(t *testing.T, ts *httptest.Server, concurrency, quality string, files map[string][]byte) (int, map[string]any) {
+func upload(t *testing.T, ts *httptest.Server, files map[string][]byte) (int, map[string]any) {
 	t.Helper()
 
 	var body bytes.Buffer
@@ -59,14 +59,6 @@ func upload(t *testing.T, ts *httptest.Server, concurrency, quality string, file
 			t.Fatal(err)
 		}
 		if _, err := io.Copy(fw, bytes.NewReader(content)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := mw.WriteField("concurrency", concurrency); err != nil {
-		t.Fatal(err)
-	}
-	if quality != "" {
-		if err := mw.WriteField("quality", quality); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -88,7 +80,53 @@ func upload(t *testing.T, ts *httptest.Server, concurrency, quality string, file
 	return resp.StatusCode, out
 }
 
-// waitForTask 轮询直至任务 done（上传即异步开跑），超时 fatal。
+// start 调开始转换接口，返回 (code, 任务快照)。
+func start(t *testing.T, ts *httptest.Server, id, concurrency, quality string) (int, map[string]any) {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	if err := mw.WriteField("concurrency", concurrency); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.WriteField("quality", quality); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.URL+"/api/tasks/"+id+"/start", mw.FormDataContentType(), &body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var out map[string]any
+	raw, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("response not JSON: %v; body: %s", err, raw)
+	}
+	return resp.StatusCode, out
+}
+
+// estimate 调预览接口，返回 (code, 响应)。
+func estimate(t *testing.T, ts *httptest.Server, id, quality string) (int, map[string]any) {
+	t.Helper()
+	resp, err := http.Get(ts.URL + "/api/tasks/" + id + "/estimate?quality=" + quality)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var out map[string]any
+	raw, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("response not JSON: %v; body: %s", err, raw)
+	}
+	return resp.StatusCode, out
+}
+
+// waitForTask 轮询直至任务 done，超时 fatal。
 func waitForTask(t *testing.T, ts *httptest.Server, id string) map[string]any {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -112,14 +150,14 @@ func waitForTask(t *testing.T, ts *httptest.Server, id string) map[string]any {
 	return nil
 }
 
-func TestUploadCreatesTask(t *testing.T) {
+func TestUploadCreatesReadyTask(t *testing.T) {
 	dataDir := t.TempDir()
 	outputs := t.TempDir()
 	svc := service.New(store.New(), dataDir, outputs)
 	ts := httptest.NewServer(handler.New(svc))
 	t.Cleanup(ts.Close)
 
-	code, resp := upload(t, ts, "8", "80", map[string][]byte{
+	code, resp := upload(t, ts, map[string][]byte{
 		"a.jpg": tinyJPEG(t, 320, 240),
 		"b.jpg": tinyJPEG(t, 320, 240),
 	})
@@ -131,22 +169,20 @@ func TestUploadCreatesTask(t *testing.T) {
 	if id == "" {
 		t.Fatal("response missing non-empty id")
 	}
+	if resp["status"] != store.TaskReady {
+		t.Errorf("status = %v, want ready (upload must not auto-start)", resp["status"])
+	}
+	dirName, _ := resp["dir_name"].(string)
+	if dirName == "" {
+		t.Error("response missing dir_name")
+	}
 	files, _ := resp["files"].([]any)
 	if len(files) != 2 {
 		t.Fatalf("len(files) = %d, want 2", len(files))
 	}
 	first, _ := files[0].(map[string]any)
-	switch first["status"] {
-	case store.StatusPending, store.StatusProcessing, store.StatusDone:
-		// 上传即异步开跑，任一瞬态均可
-	default:
-		t.Errorf("files[0].status = %v, want a pending/processing/done", first["status"])
-	}
-	if first["orig_name"] != "a.jpg" {
-		t.Errorf("files[0].orig_name = %v, want a.jpg", first["orig_name"])
-	}
-	if resp["quality"] != float64(80) {
-		t.Errorf("quality = %v, want 80", resp["quality"])
+	if first["status"] != store.StatusPending {
+		t.Errorf("files[0].status = %v, want pending", first["status"])
 	}
 
 	// 文件已落盘 uploads/<id>/
@@ -160,31 +196,6 @@ func TestUploadCreatesTask(t *testing.T) {
 			t.Errorf("uploaded file %s is empty", name)
 		}
 	}
-
-	// GET /api/tasks/{id} 可查
-	resp2, err := http.Get(ts.URL + "/api/tasks/" + id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("GET task status = %d, want 200", resp2.StatusCode)
-	}
-	var got map[string]any
-	if err := json.NewDecoder(resp2.Body).Decode(&got); err != nil {
-		t.Fatal(err)
-	}
-	if got["id"] != id {
-		t.Errorf("GET id = %v, want %v", got["id"], id)
-	}
-	if got["concurrency"] != float64(8) {
-		t.Errorf("GET concurrency = %v, want 8", got["concurrency"])
-	}
-	if got["total"] != float64(2) {
-		t.Errorf("GET total = %v, want 2", got["total"])
-	}
-
-	waitForTask(t, ts, id) // 与异步处理流同步，避免 TempDir 清理与 worker 竞争
 }
 
 func TestGetUnknownTask(t *testing.T) {
@@ -199,28 +210,148 @@ func TestGetUnknownTask(t *testing.T) {
 	}
 }
 
-func TestConcurrencyClamped(t *testing.T) {
+func TestStartAndProcess(t *testing.T) {
 	ts := newTestServer(t)
 
-	for _, tc := range []struct {
-		in   string
-		want float64
-	}{
-		{"0", 1},
-		{"-5", 1},
-		{"99", 32},
-		{"abc", 1},
-	} {
-		_, resp := upload(t, ts, tc.in, "80", map[string][]byte{"x.jpg": tinyJPEG(t, 100, 80)})
-		if resp["concurrency"] != tc.want {
-			t.Errorf("concurrency %q: got %v, want %v", tc.in, resp["concurrency"], tc.want)
-		}
-		waitForTask(t, ts, resp["id"].(string))
+	_, resp := upload(t, ts, map[string][]byte{
+		"a.jpg": tinyJPEG(t, 400, 300),
+		"b.jpg": tinyJPEG(t, 400, 300),
+	})
+	id := resp["id"].(string)
+
+	code, started := start(t, ts, id, "4", "80")
+	if code != http.StatusOK {
+		t.Fatalf("start status = %d, want 200; resp: %v", code, started)
+	}
+	if started["status"] != store.TaskProcessing {
+		t.Errorf("status = %v, want processing", started["status"])
+	}
+	if started["concurrency"] != float64(4) {
+		t.Errorf("concurrency = %v, want 4", started["concurrency"])
+	}
+
+	task := waitForTask(t, ts, id)
+	if task["done"] != float64(2) {
+		t.Errorf("done = %v, want 2", task["done"])
 	}
 }
 
-func TestQualityClamped(t *testing.T) {
+func TestStartClampsParams(t *testing.T) {
 	ts := newTestServer(t)
+
+	for _, tc := range []struct {
+		conc, qual  string
+		wantConc    float64
+		wantQuality float64
+	}{
+		{"0", "0", 1, 1},
+		{"-5", "999", 1, 100},
+		{"99", "abc", 32, 80},
+		{"abc", "70", 1, 70},
+	} {
+		_, resp := upload(t, ts, map[string][]byte{"x.jpg": tinyJPEG(t, 100, 80)})
+		id := resp["id"].(string)
+		code, started := start(t, ts, id, tc.conc, tc.qual)
+		if code != http.StatusOK {
+			t.Fatalf("start status = %d, want 200", code)
+		}
+		if started["concurrency"] != tc.wantConc {
+			t.Errorf("concurrency %q: got %v, want %v", tc.conc, started["concurrency"], tc.wantConc)
+		}
+		if started["quality"] != tc.wantQuality {
+			t.Errorf("quality %q: got %v, want %v", tc.qual, started["quality"], tc.wantQuality)
+		}
+		waitForTask(t, ts, id)
+	}
+}
+
+func TestStartUnknownTask(t *testing.T) {
+	ts := newTestServer(t)
+	code, _ := start(t, ts, "deadbeef", "1", "80")
+	if code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", code)
+	}
+}
+
+func TestStartTwiceRejected(t *testing.T) {
+	ts := newTestServer(t)
+
+	_, resp := upload(t, ts, map[string][]byte{"a.jpg": tinyJPEG(t, 200, 150)})
+	id := resp["id"].(string)
+
+	if code, _ := start(t, ts, id, "1", "80"); code != http.StatusOK {
+		t.Fatalf("first start = %d, want 200", code)
+	}
+	code, body := start(t, ts, id, "2", "90")
+	if code != http.StatusConflict {
+		t.Errorf("second start = %d, want 409", code)
+	}
+	if msg, _ := body["error"].(string); msg == "" {
+		t.Error("409 response missing error message")
+	}
+	waitForTask(t, ts, id)
+}
+
+func TestEstimate(t *testing.T) {
+	ts := newTestServer(t)
+
+	img := tinyJPEG(t, 800, 600)
+	_, resp := upload(t, ts, map[string][]byte{
+		"a.jpg":      img,
+		"broken.txt": []byte("not an image"),
+	})
+	id := resp["id"].(string)
+
+	code, est := estimate(t, ts, id, "50")
+	if code != http.StatusOK {
+		t.Fatalf("estimate status = %d, want 200", code)
+	}
+	if est["quality"] != float64(50) {
+		t.Errorf("quality = %v, want 50", est["quality"])
+	}
+	files, _ := est["files"].([]any)
+	if len(files) != 2 {
+		t.Fatalf("estimate files = %d, want 2", len(files))
+	}
+	byName := map[string]map[string]any{}
+	for _, f := range files {
+		fm := f.(map[string]any)
+		byName[fm["orig_name"].(string)] = fm
+	}
+	a := byName["a.jpg"]
+	if a["est"].(float64) <= 0 || a["est"].(float64) >= float64(len(img)) {
+		t.Errorf("a.jpg est = %v, want 0 < est < %d", a["est"], len(img))
+	}
+	if byName["broken.txt"]["err"] == "" {
+		t.Error("broken.txt missing error note")
+	}
+	if est["total"] != a["est"] {
+		t.Errorf("total = %v, want %v (only successful files)", est["total"], a["est"])
+	}
+
+	// 质量越低预估越小
+	_, est90 := estimate(t, ts, id, "90")
+	files90 := est90["files"].([]any)
+	var e50, e90 float64
+	for _, f := range files {
+		if f.(map[string]any)["orig_name"] == "a.jpg" {
+			e50 = f.(map[string]any)["est"].(float64)
+		}
+	}
+	for _, f := range files90 {
+		if f.(map[string]any)["orig_name"] == "a.jpg" {
+			e90 = f.(map[string]any)["est"].(float64)
+		}
+	}
+	if e50 >= e90 {
+		t.Errorf("q50 est %v should be < q90 est %v", e50, e90)
+	}
+}
+
+func TestEstimateQualityClamped(t *testing.T) {
+	ts := newTestServer(t)
+	_, resp := upload(t, ts, map[string][]byte{"q.jpg": tinyJPEG(t, 100, 80)})
+	id := resp["id"].(string)
 
 	for _, tc := range []struct {
 		in   string
@@ -228,21 +359,36 @@ func TestQualityClamped(t *testing.T) {
 	}{
 		{"", 80},
 		{"abc", 80},
-		{"1", 50},
-		{"999", 95},
-		{"70", 70},
+		{"0", 1},
+		{"100", 100},
+		{"999", 100},
 	} {
-		_, resp := upload(t, ts, "1", tc.in, map[string][]byte{"q.jpg": tinyJPEG(t, 100, 80)})
-		if resp["quality"] != tc.want {
-			t.Errorf("quality %q: got %v, want %v", tc.in, resp["quality"], tc.want)
+		code, est := estimate(t, ts, id, tc.in)
+		if code != http.StatusOK {
+			t.Fatalf("estimate status = %d, want 200", code)
 		}
-		waitForTask(t, ts, resp["id"].(string))
+		if est["quality"] != tc.want {
+			t.Errorf("quality %q: got %v, want %v", tc.in, est["quality"], tc.want)
+		}
+	}
+}
+
+func TestEstimateNonReady(t *testing.T) {
+	ts := newTestServer(t)
+	_, resp := upload(t, ts, map[string][]byte{"a.jpg": tinyJPEG(t, 200, 150)})
+	id := resp["id"].(string)
+	start(t, ts, id, "1", "80")
+	waitForTask(t, ts, id)
+
+	code, _ := estimate(t, ts, id, "80")
+	if code != http.StatusConflict {
+		t.Errorf("estimate after start = %d, want 409", code)
 	}
 }
 
 func TestUploadNoFiles(t *testing.T) {
 	ts := newTestServer(t)
-	code, _ := upload(t, ts, "4", "80", nil)
+	code, _ := upload(t, ts, nil)
 	if code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", code)
 	}
@@ -265,9 +411,6 @@ func TestUploadDuplicateNames(t *testing.T) {
 		if _, err := fw.Write(content); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := mw.WriteField("concurrency", "1"); err != nil {
-		t.Fatal(err)
 	}
 	if err := mw.Close(); err != nil {
 		t.Fatal(err)
@@ -294,7 +437,6 @@ func TestUploadDuplicateNames(t *testing.T) {
 		t.Fatalf("len(files) = %d, want 2", len(out.Files))
 	}
 
-	// 磁盘上两份内容都必须存在，不得互相覆盖
 	entries, err := os.ReadDir(filepath.Join(dataDir, out.ID))
 	if err != nil {
 		t.Fatal(err)
@@ -310,13 +452,12 @@ func TestUploadDuplicateNames(t *testing.T) {
 	if !seen["first content"] || !seen["second content"] {
 		t.Errorf("expected both uploads preserved on disk, got %v", seen)
 	}
-
-	waitForTask(t, ts, out.ID)
 }
 
 func TestHistory(t *testing.T) {
 	ts := newTestServer(t)
-	_, hResp := upload(t, ts, "1", "80", map[string][]byte{"h.jpg": tinyJPEG(t, 100, 80)})
+	_, hResp := upload(t, ts, map[string][]byte{"h.jpg": tinyJPEG(t, 100, 80)})
+	start(t, ts, hResp["id"].(string), "1", "80")
 	waitForTask(t, ts, hResp["id"].(string))
 
 	resp, err := http.Get(ts.URL + "/api/history")
@@ -348,11 +489,13 @@ func TestHistory(t *testing.T) {
 func TestDownloadZip(t *testing.T) {
 	ts := newTestServer(t)
 
-	_, resp := upload(t, ts, "2", "80", map[string][]byte{
+	_, resp := upload(t, ts, map[string][]byte{
 		"a.jpg":   tinyJPEG(t, 400, 300),
 		"bad.txt": []byte("not an image"),
 	})
 	id := resp["id"].(string)
+	dirName := resp["dir_name"].(string)
+	start(t, ts, id, "2", "80")
 	task := waitForTask(t, ts, id)
 	if task["done"] != float64(2) {
 		t.Fatalf("done = %v, want 2", task["done"])
@@ -369,8 +512,9 @@ func TestDownloadZip(t *testing.T) {
 	if ct := dl.Header.Get("Content-Type"); ct != "application/zip" {
 		t.Errorf("Content-Type = %q, want application/zip", ct)
 	}
-	if cd := dl.Header.Get("Content-Disposition"); !strings.Contains(cd, "attachment") {
-		t.Errorf("Content-Disposition = %q, want attachment", cd)
+	cd := dl.Header.Get("Content-Disposition")
+	if !strings.Contains(cd, "attachment") || !strings.Contains(cd, "fileforge-"+dirName+".zip") {
+		t.Errorf("Content-Disposition = %q, want attachment with fileforge-%s.zip", cd, dirName)
 	}
 
 	body, err := io.ReadAll(dl.Body)
@@ -447,13 +591,14 @@ func readEvents(t *testing.T, ts *httptest.Server, id string) []string {
 func TestEventsStream(t *testing.T) {
 	ts := newTestServer(t)
 
-	_, resp := upload(t, ts, "1", "80", map[string][]byte{
+	_, resp := upload(t, ts, map[string][]byte{
 		"a.jpg": tinyJPEG(t, 900, 700),
 		"b.jpg": tinyJPEG(t, 900, 700),
 		"c.jpg": tinyJPEG(t, 900, 700),
 		"d.jpg": tinyJPEG(t, 900, 700),
 	})
 	id := resp["id"].(string)
+	start(t, ts, id, "1", "80")
 
 	frames := readEvents(t, ts, id)
 	if len(frames) == 0 {
@@ -472,8 +617,9 @@ func TestEventsStream(t *testing.T) {
 func TestEventsAlreadyDone(t *testing.T) {
 	ts := newTestServer(t)
 
-	_, resp := upload(t, ts, "1", "80", map[string][]byte{"a.jpg": tinyJPEG(t, 200, 150)})
+	_, resp := upload(t, ts, map[string][]byte{"a.jpg": tinyJPEG(t, 200, 150)})
 	id := resp["id"].(string)
+	start(t, ts, id, "1", "80")
 	waitForTask(t, ts, id)
 
 	frames := readEvents(t, ts, id)

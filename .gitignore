@@ -1,0 +1,12 @@
+# 运行产物不入库
+outputs/
+uploads/
+
+# 构建产物
+fileforge.exe
+*.exe
+
+# 本地工具缓存
+.codegraph/
+
+# docs/ 文档库与全部源码正常入库，不做任何忽略

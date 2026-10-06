@@ -13,6 +13,7 @@ const (
 	StatusDuplicate  = "duplicate"
 	StatusFailed     = "failed"
 
+	TaskReady      = "ready" // 已上传待确认（v0.3 分步处理）
 	TaskProcessing = "processing"
 	TaskDone       = "done"
 )
@@ -33,6 +34,7 @@ type TaskSummary struct {
 	CreatedAt   time.Time
 	Concurrency int
 	Quality     int
+	Status      string
 	Files       int
 	Done        int
 	Elapsed     time.Duration
@@ -45,6 +47,7 @@ type Task struct {
 	CreatedAt   time.Time
 	Concurrency int
 	Quality     int
+	DirName     string // outputs/ 下的时间命名目录（创建时定，不可变）
 
 	mu      sync.Mutex
 	Status  string
@@ -75,13 +78,15 @@ type TaskView struct {
 	CreatedAt   time.Time
 	Concurrency int
 	Quality     int
+	DirName     string
 	Status      string
 	Done        int64
 	Elapsed     time.Duration
 	Files       []FileItem
 }
 
-func (t *Task) snapshot() TaskView {
+// Snapshot 返回任务当前状态的值拷贝视图；持锁调用。
+func (t *Task) Snapshot() TaskView {
 	files := make([]FileItem, len(t.Files))
 	for i, f := range t.Files {
 		files[i] = *f
@@ -91,6 +96,7 @@ func (t *Task) snapshot() TaskView {
 		CreatedAt:   t.CreatedAt,
 		Concurrency: t.Concurrency,
 		Quality:     t.Quality,
+		DirName:     t.DirName,
 		Status:      t.Status,
 		Done:        t.done.Load(),
 		Elapsed:     t.Elapsed,
@@ -122,7 +128,7 @@ func (s *Store) GetTask(id string) (TaskView, bool) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.snapshot(), true
+	return t.Snapshot(), true
 }
 
 // GetRef 供 service 在任务生命周期内持有可变实体并派发 worker；
@@ -144,6 +150,7 @@ func (s *Store) ListHistory() []TaskSummary {
 			CreatedAt:   t.CreatedAt,
 			Concurrency: t.Concurrency,
 			Quality:     t.Quality,
+			Status:      t.Status,
 			Files:       len(t.Files),
 			Done:        int(t.done.Load()),
 			Elapsed:     t.Elapsed,

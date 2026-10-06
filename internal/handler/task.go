@@ -20,8 +20,8 @@ import (
 const (
 	minConcurrency = 1
 	maxConcurrency = 32
-	minQuality     = 50
-	maxQuality     = 95
+	minQuality     = 1
+	maxQuality     = 100
 )
 
 type Handler struct {
@@ -33,8 +33,10 @@ func New(svc *service.Service) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.POST("/api/tasks", h.createTask)
+	r.POST("/api/tasks/:id/start", h.startTask)
 	r.GET("/api/tasks/:id", h.getTask)
 	r.GET("/api/tasks/:id/events", h.events)
+	r.GET("/api/tasks/:id/estimate", h.estimate)
 	r.GET("/api/tasks/:id/download", h.download)
 	r.GET("/api/history", h.history)
 	return r
@@ -52,14 +54,59 @@ func (h *Handler) createTask(c *gin.Context) {
 		return
 	}
 
-	view, err := h.svc.CreateTask(fhs, clampConcurrency(c.PostForm("concurrency")), clampQuality(c.PostForm("quality")))
+	// 只入库不处理：任务进入待确认，预览与开始转换走后续接口
+	view, err := h.svc.CreateTask(fhs)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	// 上传即开跑：worker 池异步处理，接口立即返回任务快照
-	go func() { _ = h.svc.RunByID(view.ID) }()
 	c.JSON(http.StatusOK, toTaskJSON(view))
+}
+
+// startTask 开始转换：写入并发数与质量后异步执行 worker 池。
+func (h *Handler) startTask(c *gin.Context) {
+	id := c.Param("id")
+	if _, ok := h.svc.Task(id); !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "任务不存在"})
+		return
+	}
+	view, err := h.svc.Reserve(id, clampConcurrency(c.PostForm("concurrency")), clampQuality(c.PostForm("quality")))
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	go func() { _ = h.svc.RunByID(id) }()
+	c.JSON(http.StatusOK, toTaskJSON(view))
+}
+
+// estimate 返回待确认任务在指定质量下的精确输出大小预览。
+func (h *Handler) estimate(c *gin.Context) {
+	id := c.Param("id")
+	view, ok := h.svc.Task(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "任务不存在"})
+		return
+	}
+	if view.Status != store.TaskReady {
+		c.JSON(http.StatusConflict, gin.H{"error": "任务已开始或已完成"})
+		return
+	}
+	quality := clampQuality(c.Query("quality"))
+	files, total, err := h.svc.Estimate(id, quality)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	out := make([]estimateFileJSON, 0, len(files))
+	for _, f := range files {
+		out = append(out, estimateFileJSON{
+			OrigName: f.Name,
+			Size:     f.Size,
+			Est:      f.Est,
+			Err:      f.Err,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"quality": quality, "total": total, "files": out})
 }
 
 // events 是 SSE 进度推送：每个文件终结一帧，任务完成发 complete 帧后关闭。
@@ -126,16 +173,17 @@ func (h *Handler) getTask(c *gin.Context) {
 
 func (h *Handler) download(c *gin.Context) {
 	id := c.Param("id")
-	if _, ok := h.svc.Task(id); !ok {
+	view, ok := h.svc.Task(id)
+	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "任务不存在"})
 		return
 	}
 
 	c.Header("Content-Type", "application/zip")
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="fileforge-%s.zip"`, id))
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="fileforge-%s.zip"`, view.DirName))
 
 	zw := zip.NewWriter(c.Writer)
-	for _, f := range h.svc.DoneFiles(id) {
+	for _, f := range h.svc.DoneFiles(view.DirName) {
 		w, err := zw.Create(f.Name)
 		if err != nil {
 			continue
@@ -159,6 +207,7 @@ func (h *Handler) history(c *gin.Context) {
 			CreatedAt:   s.CreatedAt.Format("2006-01-02 15:04:05"),
 			Concurrency: s.Concurrency,
 			Quality:     s.Quality,
+			Status:      s.Status,
 			Files:       s.Files,
 			Done:        s.Done,
 			ElapsedMS:   s.Elapsed.Milliseconds(),
@@ -207,6 +256,7 @@ type fileJSON struct {
 type taskJSON struct {
 	ID          string     `json:"id"`
 	Status      string     `json:"status"`
+	DirName     string     `json:"dir_name"`
 	Concurrency int        `json:"concurrency"`
 	Quality     int        `json:"quality"`
 	Done        int        `json:"done"`
@@ -215,11 +265,19 @@ type taskJSON struct {
 	Files       []fileJSON `json:"files"`
 }
 
+type estimateFileJSON struct {
+	OrigName string `json:"orig_name"`
+	Size     int64  `json:"size"`
+	Est      int64  `json:"est"`
+	Err      string `json:"err,omitempty"`
+}
+
 type historyJSON struct {
 	ID          string `json:"id"`
 	CreatedAt   string `json:"created_at"`
 	Concurrency int    `json:"concurrency"`
 	Quality     int    `json:"quality"`
+	Status      string `json:"status"`
 	Files       int    `json:"files"`
 	Done        int    `json:"done"`
 	ElapsedMS   int64  `json:"elapsed_ms"`
@@ -240,6 +298,7 @@ func toTaskJSON(v store.TaskView) taskJSON {
 	return taskJSON{
 		ID:          v.ID,
 		Status:      v.Status,
+		DirName:     v.DirName,
 		Concurrency: v.Concurrency,
 		Quality:     v.Quality,
 		Done:        int(v.Done),

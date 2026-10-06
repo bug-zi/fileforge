@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,9 +33,9 @@ func New(st *store.Store, uploadsDir, outputsDir string) *Service {
 	return &Service{store: st, uploads: uploadsDir, outputs: outputsDir}
 }
 
-// CreateTask 将上传文件流式落盘到 uploads/<taskID>/，建任务入表并返回快照。
-// 处理由调用方以 RunByID 异步启动。
-func (s *Service) CreateTask(fhs []*multipart.FileHeader, concurrency, quality int) (store.TaskView, error) {
+// CreateTask 将上传文件流式落盘到 uploads/<taskID>/，以「待确认」状态入表。
+// 并发数与质量由开发者在开始转换时提交（Reserve），预览大小走 Estimate。
+func (s *Service) CreateTask(fhs []*multipart.FileHeader) (store.TaskView, error) {
 	id, err := newTaskID()
 	if err != nil {
 		return store.TaskView{}, fmt.Errorf("生成任务 ID: %w", err)
@@ -43,13 +44,17 @@ func (s *Service) CreateTask(fhs []*multipart.FileHeader, concurrency, quality i
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return store.TaskView{}, fmt.Errorf("创建任务目录: %w", err)
 	}
+	// 预留时间命名的输出目录（同时防同分钟冲突）
+	dirName, err := s.reserveOutDir(time.Now())
+	if err != nil {
+		return store.TaskView{}, fmt.Errorf("创建输出目录: %w", err)
+	}
 
 	task := &store.Task{
-		ID:          id,
-		CreatedAt:   time.Now(),
-		Concurrency: concurrency,
-		Quality:     quality,
-		Status:      store.TaskProcessing,
+		ID:        id,
+		CreatedAt: time.Now(),
+		DirName:   dirName,
+		Status:    store.TaskReady,
 	}
 	for _, fh := range fhs {
 		item, err := s.saveFile(dir, fh)
@@ -79,8 +84,8 @@ type OutFile struct {
 }
 
 // DoneFiles 列出任务的全部结果文件（只含处理成功写入 outputs 的文件）。
-func (s *Service) DoneFiles(id string) []OutFile {
-	entries, err := os.ReadDir(filepath.Join(s.outputs, id))
+func (s *Service) DoneFiles(dirName string) []OutFile {
+	entries, err := os.ReadDir(filepath.Join(s.outputs, dirName))
 	if err != nil {
 		return nil
 	}
@@ -89,9 +94,118 @@ func (s *Service) DoneFiles(id string) []OutFile {
 		if e.IsDir() {
 			continue
 		}
-		out = append(out, OutFile{Name: e.Name(), Path: filepath.Join(s.outputs, id, e.Name())})
+		out = append(out, OutFile{Name: e.Name(), Path: filepath.Join(s.outputs, dirName, e.Name())})
 	}
 	return out
+}
+
+// FileEstimate 是单文件在指定质量下的精确输出大小（真实编码一次）。
+type FileEstimate struct {
+	Name string
+	Size int64
+	Est  int64
+	Err  string
+}
+
+// Estimate 按质量对每个待确认文件真实编码一次，返回精确输出大小（不写盘）。
+// 仅待确认任务可用；有界 worker 池并发编码。
+func (s *Service) Estimate(id string, quality int) ([]FileEstimate, int64, error) {
+	task := s.store.GetRef(id)
+	if task == nil {
+		return nil, 0, fmt.Errorf("任务 %q 不存在", id)
+	}
+	task.Lock()
+	if task.Status != store.TaskReady {
+		task.Unlock()
+		return nil, 0, fmt.Errorf("任务已开始或已完成")
+	}
+	items := make([]*store.FileItem, len(task.Files))
+	copy(items, task.Files)
+	task.Unlock()
+
+	results := make([]FileEstimate, len(items))
+	var total atomic.Int64
+	var wg sync.WaitGroup
+	workers := runtime.NumCPU()
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan int)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				item := items[i]
+				data, err := os.ReadFile(item.Path)
+				if err != nil {
+					results[i] = FileEstimate{Name: item.OrigName, Size: item.Size, Err: "读取文件失败: " + err.Error()}
+					continue
+				}
+				res, err := processor.Process(data, quality)
+				if err != nil {
+					results[i] = FileEstimate{Name: item.OrigName, Size: item.Size, Err: err.Error()}
+					continue
+				}
+				results[i] = FileEstimate{Name: item.OrigName, Size: item.Size, Est: int64(len(res.OutBytes))}
+				total.Add(int64(len(res.OutBytes)))
+			}
+		}()
+	}
+	for i := range items {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return results, total.Load(), nil
+}
+
+// reserveOutDir 以 YYMMDD-HHMM 命名预留输出目录；同分钟冲突追加 -2、-3。
+func (s *Service) reserveOutDir(t time.Time) (string, error) {
+	base := t.Format("060102-1504")
+	name := base
+	for i := 2; ; i++ {
+		dir := filepath.Join(s.outputs, name)
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return "", err
+			}
+			return name, nil
+		}
+		name = fmt.Sprintf("%s-%d", base, i)
+	}
+}
+
+// Reserve 将待确认任务标记为开始，写入并发数与质量；非 ready 任务拒绝。
+func (s *Service) Reserve(id string, concurrency, quality int) (store.TaskView, error) {
+	task := s.store.GetRef(id)
+	if task == nil {
+		return store.TaskView{}, fmt.Errorf("任务 %q 不存在", id)
+	}
+	task.Lock()
+	defer task.Unlock()
+	if task.Status != store.TaskReady {
+		return store.TaskView{}, fmt.Errorf("任务已开始或已完成，不能重复开始")
+	}
+	task.Concurrency = concurrency
+	task.Quality = quality
+	task.Status = store.TaskProcessing
+	return task.Snapshot(), nil
+}
+
+// Start 是便捷入口：预留（校验 + 写参数）后同步执行到完成。
+func (s *Service) Start(id string, concurrency, quality int) (store.TaskView, error) {
+	view, err := s.Reserve(id, concurrency, quality)
+	if err != nil {
+		return view, err
+	}
+	if err := s.RunByID(id); err != nil {
+		return view, err
+	}
+	return view, nil
 }
 
 // Subscribe 注册任务进度订阅者；cancel 必须在连接结束时调用。
@@ -230,7 +344,7 @@ func (s *Service) processOne(
 	}
 
 	name := processor.OutName(int(seq.Add(1)))
-	outDir := filepath.Join(s.outputs, task.ID)
+	outDir := filepath.Join(s.outputs, task.DirName)
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		s.failItem(task, item, sum, "创建输出目录失败: "+err.Error())
 		return

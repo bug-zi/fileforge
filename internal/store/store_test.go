@@ -94,8 +94,8 @@ func TestDoneCounterAndFinish(t *testing.T) {
 
 func TestListHistory(t *testing.T) {
 	s := New()
-	s.CreateTask(&Task{ID: "h1", Concurrency: 1, Files: []*FileItem{{}, {}}})
-	s.CreateTask(&Task{ID: "h2", Concurrency: 16, Files: []*FileItem{{}}})
+	s.CreateTask(&Task{ID: "h1", Concurrency: 1, Status: TaskReady, Files: []*FileItem{{}, {}}})
+	s.CreateTask(&Task{ID: "h2", Concurrency: 16, Status: TaskDone, Files: []*FileItem{{}}})
 
 	hist := s.ListHistory()
 	if len(hist) != 2 {
@@ -108,8 +108,14 @@ func TestListHistory(t *testing.T) {
 	if h := byID["h1"]; h.Files != 2 || h.Concurrency != 1 {
 		t.Errorf("h1 summary = %+v, want Files=2 Concurrency=1", h)
 	}
+	if h := byID["h1"]; h.Status != TaskReady {
+		t.Errorf("h1 status = %q, want %q", h.Status, TaskReady)
+	}
 	if h := byID["h2"]; h.Files != 1 || h.Concurrency != 16 {
 		t.Errorf("h2 summary = %+v, want Files=1 Concurrency=16", h)
+	}
+	if h := byID["h2"]; h.Status != TaskDone {
+		t.Errorf("h2 status = %q, want %q", h.Status, TaskDone)
 	}
 }
 
