@@ -9,8 +9,9 @@ import (
 	"testing"
 )
 
+// gradientJPEG 生成一个渐变的JPEG图片。
 func gradientJPEG(t *testing.T, w, h int) []byte {
-	t.Helper()
+	t.Helper() //标记这个函数是测试辅助函数。
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
@@ -21,18 +22,20 @@ func gradientJPEG(t *testing.T, w, h int) []byte {
 	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err != nil {
 		t.Fatal(err)
 	}
-	return buf.Bytes()
+	return buf.Bytes() //返回JPEG数据（二进制编码）。
 }
 
+// decodeCfg 解码图片数据的配置信息。
 func decodeCfg(t *testing.T, data []byte) image.Config {
 	t.Helper()
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data)) //这里的 cfg 是 image.Config 类型，包含图片的颜色模型，图片的宽度和高度。
 	if err != nil {
 		t.Fatalf("无法解码图片数据: %v", err)
 	}
-	return cfg
+	return cfg //返回图片配置信息，用于验证输出图片的尺寸是否正确。
 }
 
+// TestProcessShrinksLargeImage 测试 Process 函数是否能正确处理大图片。
 func TestProcessShrinksLargeImage(t *testing.T) {
 	orig := gradientJPEG(t, 2560, 1920)
 
@@ -52,6 +55,7 @@ func TestProcessShrinksLargeImage(t *testing.T) {
 	}
 }
 
+// TestProcessQualityAffectsSize 测试 Process 函数是否能正确处理不同质量的图片。
 func TestProcessQualityAffectsSize(t *testing.T) {
 	data := gradientJPEG(t, 1600, 1200)
 
@@ -69,6 +73,7 @@ func TestProcessQualityAffectsSize(t *testing.T) {
 	}
 }
 
+// TestProcessConvertsPNGToJPEG 测试 Process 函数是否能正确将PNG图片转换为JPEG图片。
 func TestProcessConvertsPNGToJPEG(t *testing.T) {
 	img := image.NewRGBA(image.Rect(0, 0, 800, 600))
 	for y := 0; y < 600; y++ {
@@ -93,6 +98,7 @@ func TestProcessConvertsPNGToJPEG(t *testing.T) {
 	}
 }
 
+// TestProcessKeepsSmallImageSize 测试 Process 函数是否能正确处理小图片。
 func TestProcessKeepsSmallImageSize(t *testing.T) {
 	orig := gradientJPEG(t, 1200, 900)
 
@@ -106,6 +112,7 @@ func TestProcessKeepsSmallImageSize(t *testing.T) {
 	}
 }
 
+// TestMD5IdenticalForSameContent 测试 Process 函数是否能正确处理相同内容的图片。
 func TestMD5IdenticalForSameContent(t *testing.T) {
 	data := gradientJPEG(t, 640, 480)
 
@@ -125,6 +132,7 @@ func TestMD5IdenticalForSameContent(t *testing.T) {
 	}
 }
 
+// TestProcessRejectsCorruptData 测试 Process 函数是否能正确处理损坏的图片数据。
 func TestProcessRejectsCorruptData(t *testing.T) {
 	for name, data := range map[string][]byte{
 		"plain text": []byte("this is not an image at all"),
@@ -137,6 +145,7 @@ func TestProcessRejectsCorruptData(t *testing.T) {
 	}
 }
 
+// TestMD5HexMatchesResultMD5 测试 Process 函数是否能正确处理相同内容的图片。
 func TestMD5HexMatchesResultMD5(t *testing.T) {
 	data := gradientJPEG(t, 640, 480)
 	res, err := Process(data, DefaultQuality)
@@ -148,6 +157,7 @@ func TestMD5HexMatchesResultMD5(t *testing.T) {
 	}
 }
 
+// TestOutNameFormat 测试 OutName 函数是否能正确格式化输出文件名。
 func TestOutNameFormat(t *testing.T) {
 	for _, tc := range []struct {
 		n    int
